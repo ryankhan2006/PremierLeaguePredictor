@@ -51,10 +51,11 @@ PremierLeaguePredictor/
 ## 🚀 Getting Started
 
 ```bash
-git clone https://github.com/your-username/PremierLeaguePredictor.git
+git clone https://github.com/ryankhan2006/PremierLeaguePredictor.git
 cd PremierLeaguePredictor
 pip install -r requirements.txt
 python main.py
+```
 
 ---
 
