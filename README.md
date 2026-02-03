@@ -37,6 +37,7 @@ This project applies machine learning techniques to analyze past EPL seasons and
 
 ## 📂 Project Structure
 
+```
 PremierLeaguePredictor/
 ├── data/ # Raw and processed datasets
 ├── models/ # Training and evaluation scripts
@@ -44,7 +45,7 @@ PremierLeaguePredictor/
 ├── predictor.py # Run predictions
 ├── requirements.txt
 └── README.md
-
+```
 
 ---
 
