@@ -8,7 +8,7 @@ The project focuses on building a reliable **backend prediction engine first**, 
 
 ## 📌 Overview
 
-This project applies machine learning techniques to analyze past EPL seasons and generate predictions for future league standings. The goal is to combine sports analytics, data engineering, and ML modeling into a scalable system.
+This project applies machine learning techniques to analyze past EPL seasons and generate predictions for future league matches. The goal is to combine sports analytics, data engineering, and ML modeling into a scalable system.
 
 ---
 
