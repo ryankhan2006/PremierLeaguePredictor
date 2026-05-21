@@ -39,9 +39,10 @@ This project applies machine learning techniques to analyze past EPL seasons and
 
 ```
 PremierLeaguePredictor/
-├── data/ # Raw and processed datasets
-├── models/ # Training and evaluation scripts
-├── utils/ # Preprocessing utilities
+├── .env # API key
+├── envexample.txt # example env file
+├── test_api.py # Check if API works
+├── main.py 
 ├── predictor.py # Run predictions
 ├── requirements.txt
 └── README.md
@@ -54,8 +55,20 @@ PremierLeaguePredictor/
 ```bash
 git clone https://github.com/ryankhan2006/PremierLeaguePredictor.git
 cd PremierLeaguePredictor
+
 pip install -r requirements.txt
-python main.py
+```
+
+Create a `.env` file:
+
+```env
+FOOTBALL_DATA_API_KEY=your_api_key_here
+```
+
+Run the server:
+
+```bash
+uvicorn main:app --reload
 ```
 
 ---
