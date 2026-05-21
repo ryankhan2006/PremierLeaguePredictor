@@ -1,6 +1,6 @@
 # ⚽ PremierLeaguePredictor
 
-A Python-based machine learning project that predicts **English Premier League (EPL)** standings using historical match data, team statistics, and player performance metrics.
+A Python-based machine learning project that predicts **English Premier League (EPL)** matches using historical match data, team statistics, and player performance metrics.
 
 The project focuses on building a reliable **backend prediction engine first**, with plans to add a **user interface (UI)** after the modeling phase is complete.
 
