@@ -65,10 +65,10 @@ Create a `.env` file:
 FOOTBALL_DATA_API_KEY=your_api_key_here
 ```
 
-Run the server:
+Run the predictor.py file (for now):
 
 ```bash
-uvicorn main:app --reload
+python predictor.py
 ```
 
 ---
