@@ -121,29 +121,103 @@ def get_team_form(df, team, before_date, n=5):
     ].tail(n)
 
     if len(past) == 0:
-        return 1.0  # neutral default (roughly 1 pt/game) if no history yet
+        return {
+            "ppg": 1.0,
+            "goals_for": 1.0,
+            "goals_against": 1.0,
+            "goal_diff": 0.0,
+            "win_rate": 0.33,
+        }  # neutral default (roughly 1 pt/game) if no history yet
 
     points = 0
+    goals_for = 0
+    goals_against = 0
+    wins = 0
+    
     for _, row in past.iterrows():
         if row["home_team"] == team:
-            points += 3 if row["result"] == "H" else (1 if row["result"] == "D" else 0)
-        else:
-            points += 3 if row["result"] == "A" else (1 if row["result"] == "D" else 0)
-    return points / len(past)
+            gf = row["home_goals"]
+            ga = row["away_goals"]
 
+            if row["result"] == "H":
+                points += 3
+                wins += 1
+            elif row["result"] == "D":
+                points += 1
+        else:
+            gf = row["away_goals"]
+            ga = row["home_goals"]
+
+            if row["result"] == "A":
+                points += 3
+                wins += 1
+            elif row["result"] == "D":
+                points += 1
+        
+        goals_for += gf
+        goals_against += ga
+    
+    games = len(past)
+
+    return {
+        "ppg": points / games,
+        "goals_for": goals_for / games,
+        "goals_against": goals_against / games,
+        "goal_diff": (goals_for - goals_against) / games,
+        "win_rate": wins / games,
+    }
 
 def build_features(df):
     """Build a feature row (home form, away form, form diff) for every match."""
     feature_rows = []
     for _, row in df.iterrows():
-        home_form = get_team_form(df, row["home_team"], row["date"])
-        away_form = get_team_form(df, row["away_team"], row["date"])
+        
+        home5 = get_team_form(
+            df,
+            row["home_team"],
+            row["date"],
+            n=5
+        )
+
+        away5 = get_team_form(
+            df,
+            row["away_team"],
+            row["date"],
+            n=5
+        )
+
+        home10 = get_team_form(
+            df,
+            row["home_team"],
+            row["date"],
+            n=10
+        )
+
+        away10 = get_team_form(
+            df,
+            row["away_team"],
+            row["date"],
+            n=10
+        )
+
         feature_rows.append({
-            "home_form": home_form,
-            "away_form": away_form,
-            "form_diff": home_form - away_form,
+            "home_ppg_5": home5["ppg"],
+            "away_ppg_5": away5["ppg"],
+            "home_ppg_10": home10["ppg"],
+            "away_ppg_10": away10["ppg"],
+            "home_gf": home10["goals_for"],
+            "away_gf": away10["goals_for"],
+            "home_ga": home10["goals_against"],
+            "away_ga": away10["goals_against"],
+            "home_gd": home10["goal_diff"],
+            "away_gd": away10["goal_diff"],
+            "home_win_rate": home10["win_rate"],
+            "away_win_rate": away10["win_rate"],
+            "ppg_diff": home10["ppg"] - away10["ppg"],
+            "gd_diff": home10["goal_diff"] - away10["goal_diff"],
             "result": row["result"],
         })
+        
     return pd.DataFrame(feature_rows)
 
 
@@ -151,21 +225,40 @@ def build_features(df):
 
 def train_model(features_df):
     """Train a RandomForest classifier on Win/Draw/Loss and save it to disk."""
-    X = features_df[["home_form", "away_form", "form_diff"]]
+    feature_columns = [
+        "home_ppg_5", "away_ppg_5", "home_ppg_10", "away_ppg_10",
+        "home_gf", "away_gf", "home_ga", "away_ga",
+        "home_gd", "away_gd", "home_win_rate", "away_win_rate",
+        "ppg_diff", "gd_diff"
+    ]
+
+    X = features_df[feature_columns]
     y = features_df["result"]
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
+    split = int(len(features_df) * 0.8)
+
+    X_train = X.iloc[:split]
+    X_test = X.iloc[split:]
+    y_train = y.iloc[:split]
+    y_test = y.iloc[split:]
+
+    model = RandomForestClassifier(
+        n_estimators=500,
+        max_depth=10,
+        min_samples_split=10,
+        min_samples_leaf=4,
+        max_features="sqrt",
+        class_weight="balanced",
+        random_state=42,
+        n_jobs=-1
     )
 
-    model = RandomForestClassifier(n_estimators=200, random_state=42)
     model.fit(X_train, y_train)
-
-    preds = model.predict(X_test)
-    acc = accuracy_score(y_test, preds)
-    print(f"Model accuracy: {acc:.2%}")
-
+    predictions = model.predict(X_test)
+    accuracy = accuracy_score(y_test, predictions)
+    print(f"Model trained. Test set accuracy: {accuracy:.2%}")
     joblib.dump(model, "model.pkl")
+
     return model
 
 
@@ -223,18 +316,37 @@ def fetch_fixtures(competition="PL", status="SCHEDULED"):
 
 def predict_fixture(model, hist_df, home_team, away_team, match_date):
     """Predict one fixture's outcome using form calculated as of match_date."""
-    home_form = get_team_form(hist_df, home_team, match_date)
-    away_form = get_team_form(hist_df, away_team, match_date)
-    form_diff = home_form - away_form
+    
+    #Last 5 matches
+    home5 = get_team_form(hist_df, home_team, match_date, n=5)
+    away5 = get_team_form(hist_df, away_team, match_date, n=5)
 
-    X_new = pd.DataFrame([{
-        "home_form": home_form,
-        "away_form": away_form,
-        "form_diff": form_diff,
-    }])
+    #Last 10 matches
+    home10 = get_team_form(hist_df, home_team, match_date, n=10)
+    away10 = get_team_form(hist_df, away_team, match_date, n=10)
 
+    # Must match the exact features used in train_model()
+    feature_data = {
+        "home_ppg_5": home5["ppg"],
+        "away_ppg_5": away5["ppg"],
+        "home_ppg_10": home10["ppg"],
+        "away_ppg_10": away10["ppg"],
+        "home_gf": home10["goals_for"],
+        "away_gf": away10["goals_for"],
+        "home_ga": home10["goals_against"],
+        "away_ga": away10["goals_against"],
+        "home_gd": home10["goal_diff"],
+        "away_gd": away10["goal_diff"],
+        "home_win_rate": home10["win_rate"],
+        "away_win_rate": away10["win_rate"],
+        "ppg_diff": (home10["ppg"] - away10["ppg"]),
+        "gd_diff": (home10["goal_diff"] - away10["goal_diff"]),
+    }
+
+    X_new = pd.DataFrame([feature_data])
     prediction = model.predict(X_new)[0]
     probabilities = dict(zip(model.classes_, model.predict_proba(X_new)[0]))
+
     return prediction, probabilities
 
 
@@ -246,6 +358,7 @@ def predict_season(model, hist_df, fixtures_df):
     early in the season will look similar. This is a simplification —
     a more advanced version could update form as predicted results roll in.
     """
+    
     predictions = []
     probs_list = []
     for _, row in fixtures_df.iterrows():
