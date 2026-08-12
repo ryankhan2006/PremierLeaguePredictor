@@ -1,80 +1,80 @@
-import requests
-import csv
-import time
 import os
-from dotenv import load_dotenv
+import pandas as pd
 
-# Load the API key from .env file
-load_dotenv()
-API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
+# Seasons used to train the model (historical data)
+SEASONS = ["1819", "1920", "2021", "2122", "2223", "2324", "2425", "2526"]
 
-# The seasons we want to get data for
-seasons = [2022, 2023, 2024]
 
-# This will hold all our matches
-all_matches = []
+TEAM_NAME_MAP = {
+    "Arsenal": "Arsenal FC",
+    "Aston Villa": "Aston Villa FC",
+    "Bournemouth": "AFC Bournemouth",
+    "Brentford": "Brentford FC",
+    "Brighton": "Brighton & Hove Albion FC",
+    "Chelsea": "Chelsea FC",
+    "Coventry": "Coventry City FC",
+    "Crystal Palace": "Crystal Palace FC",
+    "Everton": "Everton FC",
+    "Fulham": "Fulham FC",
+    "Hull": "Hull City AFC",
+    "Ipswich": "Ipswich Town FC",
+    "Leeds": "Leeds United FC",
+    "Liverpool": "Liverpool FC",
+    "Man City": "Manchester City FC",
+    "Man United": "Manchester United FC",
+    "Newcastle": "Newcastle United FC",
+    "Nott'm Forest": "Nottingham Forest FC",
+    "Sunderland": "Sunderland AFC",
+    "Tottenham": "Tottenham Hotspur FC",
 
-# Loop through each season and fetch matches
-for season in seasons:
-    print(f"Fetching season {season}...")
+    # Historical teams (not in prem right now)
+    "West Ham": "West Ham United FC",
+    "Burnley": "Burnley FC",
+    "Wolves": "Wolverhampton Wanderers FC",
+    "Leicester": "Leicester City FC",
+    "Southampton": "Southampton FC",
+    "Sheffield United": "Sheffield United FC",
+    "Norwich": "Norwich City FC",
+    "Watford": "Watford FC",
+}
 
-    url = f"https://api.football-data.org/v4/competitions/PL/matches?season={season}"
-    headers = {"X-Auth-Token": API_KEY}
+def fetch_season(season_code):
+    print(f"Fetching {season_code[:2]}/{season_code[2:]} season...")
+    url = f"https://www.football-data.co.uk/mmz4281/{season_code}/E0.csv"
+    df = pd.read_csv(url)
+    df = df[["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]].copy()
 
-    response = requests.get(url, headers=headers)
+    df.columns = ["date", "home_team", "away_team", "home_goals", "away_goals", "result"]
+    df["home_team"] = (df["home_team"].map(TEAM_NAME_MAP).fillna(df["home_team"]))
+    df["away_team"] = (df["away_team"].map(TEAM_NAME_MAP).fillna(df["away_team"]))
+    df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce", utc=True)
 
-    # Check if the request worked
-    if response.status_code != 200:
-        print(f"  Could not get season {season}, skipping...")
-        continue
+    df = df.dropna(subset=["date", "home_team", "away_team", "home_goals", "away_goals", "result"])
 
-    # Get the list of matches from the response
-    matches = response.json()["matches"]
-    print(f"  Got {len(matches)} matches")
+    df["season"] = season_code
+    print(f" Got {len(df)} matches")
+    return df
 
-    # Loop through each match and grab what we need
-    for match in matches:
+def main():
+    all_seasons = []
 
-        # Skip matches that haven't been played yet
-        if match["status"] != "FINISHED":
-            continue
+    for season in SEASONS:
+        season_df = fetch_season(season)
+        all_seasons.append(season_df)
 
-        home_team = match["homeTeam"]["name"]
-        away_team = match["awayTeam"]["name"]
-        date = match["utcDate"][:10]
-        matchday = match["matchday"]
-        home_goals = match["score"]["fullTime"]["home"]
-        away_goals = match["score"]["fullTime"]["away"]
+    matches = pd.concat(all_seasons, ignore_index=True)
 
-        # Figure out the result
-        if home_goals > away_goals:
-            result = "H"  # Home win
-        elif home_goals < away_goals:
-            result = "A"  # Away win
-        else:
-            result = "D"  # Draw
+    matches = matches.sort_values(by="date").reset_index(drop=True)
 
-        # Add this match to our list
-        all_matches.append({
-            "date": date,
-            "season": season,
-            "matchday": matchday,
-            "home_team": home_team,
-            "away_team": away_team,
-            "home_goals": home_goals,
-            "away_goals": away_goals,
-            "result": result
-        })
+    os.makedirs("data", exist_ok=True)
 
-    # Wait 7 seconds before next request so we don't get rate limited
-    time.sleep(7)
+    matches.to_csv("data/matches.csv", index=False)
 
-# Save everything to a CSV file
-os.makedirs("data", exist_ok=True)
+    print(f"\nDone! Saved {len(matches)} matches to data/historical_matches.csv")
 
-with open("data/matches.csv", "w", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=["date", "season", "matchday", "home_team", "away_team", "home_goals", "away_goals", "result"])
-    writer.writeheader()
-    writer.writerows(all_matches)
+if __name__ == "__main__":
+    main()
 
-print(f"\nDone! Saved {len(all_matches)} matches to data/matches.csv")
+
+
+

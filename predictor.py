@@ -1,125 +1,136 @@
 """
-predictor.py — Premier League 2026/27 standings predictor
+predictor.py — Premier League 2026/27 predictor
 
 Pipeline:
-1. Load several past seasons of match results (football-data.co.uk CSVs —
-   works even though football-data.org's free API only allows the current
-   season's data)
-2. Engineer features (recent team form)
-3. Train a classifier (Win/Draw/Loss)
-4. Fetch every scheduled 2026/27 fixture from football-data.org
-5. Predict every fixture, then simulate the resulting league table
+1. Load historical matches from data/matches.csv
+2. Build recent team-performance features
+3. Train/evaluate a Random Forest classifier
+4. Fetch the 2026/27 fixture list
+5. Predict H/D/A probabilities for every fixture
+6. Run thousands of Monte Carlo season simulations
+7. Calculate expected standings and finishing probabilities
 """
 
 import os
 
 import joblib
+import numpy as np
 import pandas as pd
 import requests
+
 from dotenv import load_dotenv
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    log_loss,
+)
+
+
+# ==================================================
+# CONFIG
+# ==================================================
 
 load_dotenv()
+
 API_KEY = os.getenv("FOOTBALL_DATA_API_KEY")
+
 BASE_URL = "https://api.football-data.org/v4"
-HEADERS = {"X-Auth-Token": API_KEY}
 
-# football-data.co.uk season codes: "2425" = 2024/25 season, etc.
-# Using the last 4 completed seasons gives a solid training set (~1,520 matches)
-HISTORICAL_SEASON_CODES = ["2223", "2324", "2425", "2526"]
-
-# football-data.co.uk uses short team names 
-# football-data.org's API uses full names 
-# We standardize everything to the football-data.org names so historical
-# data and the 26/27 fixture list can be joined together.
-TEAM_NAME_MAP = {
-    "Arsenal": "Arsenal FC",
-    "Aston Villa": "Aston Villa FC",
-    "Bournemouth": "AFC Bournemouth",
-    "Brentford": "Brentford FC",
-    "Brighton": "Brighton & Hove Albion FC",
-    "Chelsea": "Chelsea FC",
-    "Coventry": "Coventry City FC",
-    "Crystal Palace": "Crystal Palace FC",
-    "Everton": "Everton FC",
-    "Fulham": "Fulham FC",
-    "Hull": "Hull City AFC",
-    "Ipswich": "Ipswich Town FC",
-    "Leeds": "Leeds United FC",
-    "Liverpool": "Liverpool FC",
-    "Man City": "Manchester City FC",
-    "Man United": "Manchester United FC",
-    "Newcastle": "Newcastle United FC",
-    "Nott'm Forest": "Nottingham Forest FC",
-    "Sunderland": "Sunderland AFC",
-    "Tottenham": "Tottenham Hotspur FC",
-    # Recently-relegated teams that still appear in historical data —
-    # kept so past matches involving them parse correctly, even though
-    # they won't appear in the 26/27 fixture list.
-    "West Ham": "West Ham United FC",
-    "Burnley": "Burnley FC",
-    "Wolves": "Wolverhampton Wanderers FC",
-    "Leicester": "Leicester City FC",
-    "Southampton": "Southampton FC",
+HEADERS = {
+    "X-Auth-Token": API_KEY
 }
 
-# The 20 teams playing in the 2026/27 season 
-TEAMS_2026_27 = [
-    "Arsenal FC", "Aston Villa FC", "AFC Bournemouth", "Brentford FC",
-    "Brighton & Hove Albion FC", "Chelsea FC", "Coventry City FC",
-    "Crystal Palace FC", "Everton FC", "Fulham FC", "Hull City FC",
-    "Ipswich Town FC", "Leeds United FC", "Liverpool FC",
-    "Manchester City FC", "Manchester United FC", "Newcastle United FC",
-    "Nottingham Forest FC", "Sunderland AFC", "Tottenham Hotspur FC",
+
+FEATURE_COLUMNS = [
+    "home_ppg_5",
+    "away_ppg_5",
+    "home_ppg_10",
+    "away_ppg_10",
+
+    "home_gf",
+    "away_gf",
+
+    "home_ga",
+    "away_ga",
+
+    "home_gd",
+    "away_gd",
+
+    "home_win_rate",
+    "away_win_rate",
+
+    "ppg_diff",
+    "gd_diff",
 ]
 
 
-# Load historical match data
+# Number of seasons to simulate
+N_SIMULATIONS = 5000
 
-def fetch_historical_season(season_code):
-    """Download one season's match results as a DataFrame from football-data.co.uk.
+RANDOM_SEED = 42
 
-    season_code example: '2425' for the 2024/25 season.
+
+# ==================================================
+# LOAD HISTORICAL DATA
+# ==================================================
+
+def load_historical_data(
+    path="data/matches.csv"
+):
+    """Load cleaned historical Premier League matches."""
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} was not found. "
+            "Run data_fetcher.py first."
+        )
+
+    df = pd.read_csv(path)
+
+    df["date"] = pd.to_datetime(
+        df["date"],
+        utc=True
+    )
+
+    df = df.sort_values(
+        "date"
+    ).reset_index(drop=True)
+
+    print(
+        f"Loaded {len(df)} historical matches "
+        f"from {path}."
+    )
+
+    return df
+
+
+# ==================================================
+# TEAM STATISTICS
+# ==================================================
+
+def get_team_stats(
+    df,
+    team,
+    before_date,
+    n=5
+):
     """
-    url = f"https://www.football-data.co.uk/mmz4281/{season_code}/E0.csv"
-    df = pd.read_csv(url)
+    Calculate statistics from a team's
+    previous n matches.
+    """
 
-    df = df[["Date", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]].copy()
-    df.columns = ["date", "home_team", "away_team", "home_goals", "away_goals", "result"]
-
-    # Standardize team names to match football-data.org's naming
-    df["home_team"] = df["home_team"].map(TEAM_NAME_MAP).fillna(df["home_team"])
-    df["away_team"] = df["away_team"].map(TEAM_NAME_MAP).fillna(df["away_team"])
-
-    # football-data.co.uk dates are day-first (DD/MM/YYYY)
-    df["date"] = pd.to_datetime(df["date"], dayfirst=True, utc=True)
-    return df
-
-# Downloading all seaosons
-def fetch_historical_data(season_codes=HISTORICAL_SEASON_CODES):
-    """Download and combine multiple seasons of historical match data."""
-    all_seasons = []
-    for code in season_codes:
-        print(f"Fetching {code[:2]}/{code[2:]} season data...")
-        all_seasons.append(fetch_historical_season(code))
-
-    df = pd.concat(all_seasons, ignore_index=True)
-    df = df.sort_values("date").reset_index(drop=True)
-    print(f"Loaded {len(df)} historical matches total.")
-    return df
-
-
-# Step 2: Feature engineering (unchanged logic from the single-season version)
-
-def get_team_form(df, team, before_date, n=5):
-    """Points per game for a team's last n matches before a given date."""
     past = df[
-        ((df["home_team"] == team) | (df["away_team"] == team))
-        & (df["date"] < before_date)
+        (
+            (df["home_team"] == team)
+            |
+            (df["away_team"] == team)
+        )
+        &
+        (df["date"] < before_date)
     ].tail(n)
 
+    # Neutral default for teams without history
     if len(past) == 0:
         return {
             "ppg": 1.0,
@@ -127,120 +138,229 @@ def get_team_form(df, team, before_date, n=5):
             "goals_against": 1.0,
             "goal_diff": 0.0,
             "win_rate": 0.33,
-        }  # neutral default (roughly 1 pt/game) if no history yet
+        }
 
     points = 0
     goals_for = 0
     goals_against = 0
     wins = 0
-    
+
     for _, row in past.iterrows():
+
+        # Team was home
         if row["home_team"] == team:
-            gf = row["home_goals"]
-            ga = row["away_goals"]
+
+            goals_for += row["home_goals"]
+            goals_against += row["away_goals"]
 
             if row["result"] == "H":
                 points += 3
                 wins += 1
+
             elif row["result"] == "D":
                 points += 1
+
+        # Team was away
         else:
-            gf = row["away_goals"]
-            ga = row["home_goals"]
+
+            goals_for += row["away_goals"]
+            goals_against += row["home_goals"]
 
             if row["result"] == "A":
                 points += 3
                 wins += 1
+
             elif row["result"] == "D":
                 points += 1
-        
-        goals_for += gf
-        goals_against += ga
-    
+
     games = len(past)
 
     return {
-        "ppg": points / games,
-        "goals_for": goals_for / games,
-        "goals_against": goals_against / games,
-        "goal_diff": (goals_for - goals_against) / games,
-        "win_rate": wins / games,
+        "ppg":
+            points / games,
+
+        "goals_for":
+            goals_for / games,
+
+        "goals_against":
+            goals_against / games,
+
+        "goal_diff":
+            (
+                goals_for
+                - goals_against
+            ) / games,
+
+        "win_rate":
+            wins / games,
     }
 
+
+# ==================================================
+# FEATURE ENGINEERING
+# ==================================================
+
+def create_feature_row(
+    df,
+    home_team,
+    away_team,
+    match_date
+):
+    """
+    Create the exact feature set required
+    by the model for one fixture.
+    """
+
+    home5 = get_team_stats(
+        df,
+        home_team,
+        match_date,
+        n=5
+    )
+
+    away5 = get_team_stats(
+        df,
+        away_team,
+        match_date,
+        n=5
+    )
+
+    home10 = get_team_stats(
+        df,
+        home_team,
+        match_date,
+        n=10
+    )
+
+    away10 = get_team_stats(
+        df,
+        away_team,
+        match_date,
+        n=10
+    )
+
+    return {
+        "home_ppg_5":
+            home5["ppg"],
+
+        "away_ppg_5":
+            away5["ppg"],
+
+        "home_ppg_10":
+            home10["ppg"],
+
+        "away_ppg_10":
+            away10["ppg"],
+
+        "home_gf":
+            home10["goals_for"],
+
+        "away_gf":
+            away10["goals_for"],
+
+        "home_ga":
+            home10["goals_against"],
+
+        "away_ga":
+            away10["goals_against"],
+
+        "home_gd":
+            home10["goal_diff"],
+
+        "away_gd":
+            away10["goal_diff"],
+
+        "home_win_rate":
+            home10["win_rate"],
+
+        "away_win_rate":
+            away10["win_rate"],
+
+        "ppg_diff":
+            (
+                home10["ppg"]
+                - away10["ppg"]
+            ),
+
+        "gd_diff":
+            (
+                home10["goal_diff"]
+                - away10["goal_diff"]
+            ),
+    }
+
+
 def build_features(df):
-    """Build a feature row (home form, away form, form diff) for every match."""
-    feature_rows = []
-    for _, row in df.iterrows():
-        
-        home5 = get_team_form(
+    """
+    Build training features for every
+    historical match.
+    """
+
+    rows = []
+
+    print("Building features...")
+
+    for _, match in df.iterrows():
+
+        features = create_feature_row(
             df,
-            row["home_team"],
-            row["date"],
-            n=5
+            match["home_team"],
+            match["away_team"],
+            match["date"]
         )
 
-        away5 = get_team_form(
-            df,
-            row["away_team"],
-            row["date"],
-            n=5
+        features["result"] = (
+            match["result"]
         )
 
-        home10 = get_team_form(
-            df,
-            row["home_team"],
-            row["date"],
-            n=10
+        rows.append(
+            features
         )
 
-        away10 = get_team_form(
-            df,
-            row["away_team"],
-            row["date"],
-            n=10
-        )
-
-        feature_rows.append({
-            "home_ppg_5": home5["ppg"],
-            "away_ppg_5": away5["ppg"],
-            "home_ppg_10": home10["ppg"],
-            "away_ppg_10": away10["ppg"],
-            "home_gf": home10["goals_for"],
-            "away_gf": away10["goals_for"],
-            "home_ga": home10["goals_against"],
-            "away_ga": away10["goals_against"],
-            "home_gd": home10["goal_diff"],
-            "away_gd": away10["goal_diff"],
-            "home_win_rate": home10["win_rate"],
-            "away_win_rate": away10["win_rate"],
-            "ppg_diff": home10["ppg"] - away10["ppg"],
-            "gd_diff": home10["goal_diff"] - away10["goal_diff"],
-            "result": row["result"],
-        })
-        
-    return pd.DataFrame(feature_rows)
+    return pd.DataFrame(
+        rows
+    )
 
 
-# Train the model
+# ==================================================
+# TRAIN MODEL
+# ==================================================
 
 def train_model(features_df):
-    """Train a RandomForest classifier on Win/Draw/Loss and save it to disk."""
-    feature_columns = [
-        "home_ppg_5", "away_ppg_5", "home_ppg_10", "away_ppg_10",
-        "home_gf", "away_gf", "home_ga", "away_ga",
-        "home_gd", "away_gd", "home_win_rate", "away_win_rate",
-        "ppg_diff", "gd_diff"
+    """
+    Train and evaluate the Random Forest.
+    """
+
+    X = features_df[
+        FEATURE_COLUMNS
     ]
 
-    X = features_df[feature_columns]
-    y = features_df["result"]
+    y = features_df[
+        "result"
+    ]
 
-    split = int(len(features_df) * 0.8)
+    # Chronological split:
+    # first 80% train
+    # latest 20% test
+    split = int(
+        len(features_df) * 0.8
+    )
 
-    X_train = X.iloc[:split]
-    X_test = X.iloc[split:]
-    y_train = y.iloc[:split]
-    y_test = y.iloc[split:]
+    X_train = X.iloc[
+        :split
+    ]
+
+    X_test = X.iloc[
+        split:
+    ]
+
+    y_train = y.iloc[
+        :split
+    ]
+
+    y_test = y.iloc[
+        split:
+    ]
 
     model = RandomForestClassifier(
         n_estimators=500,
@@ -248,219 +368,849 @@ def train_model(features_df):
         min_samples_split=10,
         min_samples_leaf=4,
         max_features="sqrt",
-        class_weight="balanced",
         random_state=42,
-        n_jobs=-1
+        n_jobs=-1,
     )
 
-    model.fit(X_train, y_train)
-    predictions = model.predict(X_test)
-    accuracy = accuracy_score(y_test, predictions)
-    print(f"Model trained. Test set accuracy: {accuracy:.2%}")
-    joblib.dump(model, "model.pkl")
+    print(
+        "Training Random Forest..."
+    )
+
+    model.fit(
+        X_train,
+        y_train
+    )
+
+    predictions = model.predict(
+        X_test
+    )
+
+    probabilities = model.predict_proba(
+        X_test
+    )
+
+    accuracy = accuracy_score(
+        y_test,
+        predictions
+    )
+
+    print(
+        f"\nModel Accuracy: "
+        f"{accuracy:.2%}"
+    )
+
+    print(
+        "\n=== Classification Report ==="
+    )
+
+    print(
+        classification_report(
+            y_test,
+            predictions
+        )
+    )
+
+    loss = log_loss(
+        y_test,
+        probabilities,
+        labels=model.classes_
+    )
+
+    print(
+        f"Log Loss: "
+        f"{loss:.4f}"
+    )
+
+    joblib.dump(
+        model,
+        "model.pkl"
+    )
+
+    print(
+        "\nModel saved to model.pkl"
+    )
 
     return model
 
 
-def load_or_train_model(df, force_retrain=False):
-    """Load a saved model if one exists, otherwise train a new one."""
-    if not force_retrain:
-        try:
-            model = joblib.load("model.pkl")
-            print("Loaded existing model.pkl")
-            return model
-        except FileNotFoundError:
-            pass
-    print("Training a new model...")
-    features_df = build_features(df)
-    return train_model(features_df)
-
-
-# Fetch the real 26/27 fixture list
-
-def fetch_fixtures(competition="PL", status="SCHEDULED"):
-    """Pull the upcoming fixture list for the current (2026/27) season.
-
-    This works on the free tier because it's the CURRENT season — the free
-    tier restriction only blocks pulling *past* seasons, not upcoming
-    fixtures in the season that's live right now.
+def load_or_train_model(
+    hist_df,
+    force_retrain=False
+):
     """
-    url = f"{BASE_URL}/competitions/{competition}/matches"
-    params = {"status": status}
-    response = requests.get(url, headers=HEADERS, params=params)
-    if response.status_code != 200:
-        print(f"API error {response.status_code}: {response.text}")
-    response.raise_for_status()
-    matches = response.json()["matches"]
-    if not matches:
+    Load model.pkl if it exists.
+    Otherwise train a new model.
+    """
+
+    if (
+        os.path.exists("model.pkl")
+        and not force_retrain
+    ):
+
+        print(
+            "Loaded existing model.pkl"
+        )
+
+        return joblib.load(
+            "model.pkl"
+        )
+
+    print(
+        "Training a new model..."
+    )
+
+    features_df = build_features(
+        hist_df
+    )
+
+    return train_model(
+        features_df
+    )
+
+
+# ==================================================
+# FETCH 2026/27 FIXTURES
+# ==================================================
+
+def fetch_fixtures(
+    competition="PL",
+    status="SCHEDULED"
+):
+    """
+    Fetch upcoming Premier League fixtures
+    from football-data.org.
+    """
+
+    if not API_KEY:
         raise ValueError(
-            f"No fixtures returned for status={status}. "
-            "The fixture list may not be published yet."
+            "FOOTBALL_DATA_API_KEY "
+            "was not found in .env"
+        )
+
+    url = (
+        f"{BASE_URL}/competitions/"
+        f"{competition}/matches"
+    )
+
+    params = {
+        "status": status
+    }
+
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        params=params,
+        timeout=20
+    )
+
+    if response.status_code != 200:
+
+        print(
+            f"API error "
+            f"{response.status_code}: "
+            f"{response.text}"
+        )
+
+    response.raise_for_status()
+
+    matches = response.json()[
+        "matches"
+    ]
+
+    if not matches:
+
+        raise ValueError(
+            "No scheduled fixtures returned."
         )
 
     rows = []
-    for m in matches:
+
+    for match in matches:
+
         rows.append({
-            "date": m["utcDate"],
-            "home_team": m["homeTeam"]["name"],
-            "away_team": m["awayTeam"]["name"],
+            "date":
+                match["utcDate"],
+
+            "home_team":
+                match["homeTeam"]["name"],
+
+            "away_team":
+                match["awayTeam"]["name"],
         })
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").reset_index(drop=True)
-    print(f"Loaded {len(df)} scheduled fixtures for the 26/27 season.")
-    return df
 
+    fixtures_df = pd.DataFrame(
+        rows
+    )
 
-# Predict every fixture, then simulate the standings table
-
-def predict_fixture(model, hist_df, home_team, away_team, match_date):
-    """Predict one fixture's outcome using form calculated as of match_date."""
-    
-    #Last 5 matches
-    home5 = get_team_form(hist_df, home_team, match_date, n=5)
-    away5 = get_team_form(hist_df, away_team, match_date, n=5)
-
-    #Last 10 matches
-    home10 = get_team_form(hist_df, home_team, match_date, n=10)
-    away10 = get_team_form(hist_df, away_team, match_date, n=10)
-
-    # Must match the exact features used in train_model()
-    feature_data = {
-        "home_ppg_5": home5["ppg"],
-        "away_ppg_5": away5["ppg"],
-        "home_ppg_10": home10["ppg"],
-        "away_ppg_10": away10["ppg"],
-        "home_gf": home10["goals_for"],
-        "away_gf": away10["goals_for"],
-        "home_ga": home10["goals_against"],
-        "away_ga": away10["goals_against"],
-        "home_gd": home10["goal_diff"],
-        "away_gd": away10["goal_diff"],
-        "home_win_rate": home10["win_rate"],
-        "away_win_rate": away10["win_rate"],
-        "ppg_diff": (home10["ppg"] - away10["ppg"]),
-        "gd_diff": (home10["goal_diff"] - away10["goal_diff"]),
-    }
-
-    X_new = pd.DataFrame([feature_data])
-    prediction = model.predict(X_new)[0]
-    probabilities = dict(zip(model.classes_, model.predict_proba(X_new)[0]))
-
-    return prediction, probabilities
-
-
-def predict_season(model, hist_df, fixtures_df):
-    """Predict every fixture in the season. Returns fixtures_df with predictions added.
-
-    NOTE: this predicts every match using only PRE-SEASON form (since none of
-    these matches have been played yet), so all fixtures for a given team
-    early in the season will look similar. This is a simplification —
-    a more advanced version could update form as predicted results roll in.
-    """
-    
-    predictions = []
-    probs_list = []
-    for _, row in fixtures_df.iterrows():
-        pred, probs = predict_fixture(
-            model, hist_df, row["home_team"], row["away_team"], row["date"]
+    fixtures_df["date"] = (
+        pd.to_datetime(
+            fixtures_df["date"],
+            utc=True
         )
-        predictions.append(pred)
-        probs_list.append(probs)
+    )
 
-    fixtures_df = fixtures_df.copy()
-    fixtures_df["predicted_result"] = predictions
-    fixtures_df["probabilities"] = probs_list
+    fixtures_df = (
+        fixtures_df
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+    print(
+        f"Loaded {len(fixtures_df)} "
+        "scheduled fixtures."
+    )
+
     return fixtures_df
 
 
-def simulate_standings(predicted_fixtures, teams=None):
-    """Turn match-level predictions into a full league table.
+# ==================================================
+# PREDICT ONE FIXTURE
+# ==================================================
 
-    3 points for a predicted win, 1 for a predicted draw, 0 for a loss —
-    same scoring as the real Premier League table.
-
-    teams: list of team names to include. If not given, this is derived
-    directly from the fixture list itself — this avoids silent bugs where
-    a hardcoded team name doesn't exactly match what the API returns
-    (e.g. "Hull City FC" vs the API's actual "Hull City AFC").
+def predict_fixture(
+    model,
+    hist_df,
+    home_team,
+    away_team,
+    match_date
+):
     """
+    Predict H/D/A probabilities for
+    one match.
+    """
+
+    feature_data = create_feature_row(
+        hist_df,
+        home_team,
+        away_team,
+        match_date
+    )
+
+    X_new = pd.DataFrame(
+        [feature_data]
+    )
+
+    X_new = X_new[
+        FEATURE_COLUMNS
+    ]
+
+    probability_values = (
+        model.predict_proba(
+            X_new
+        )[0]
+    )
+
+    probabilities = dict(
+        zip(
+            model.classes_,
+            probability_values
+        )
+    )
+
+    # Most likely outcome
+    prediction = max(
+        probabilities,
+        key=probabilities.get
+    )
+
+    return (
+        prediction,
+        probabilities
+    )
+
+
+# ==================================================
+# PREDICT ALL FIXTURES
+# ==================================================
+
+def predict_season(
+    model,
+    hist_df,
+    fixtures_df
+):
+    """
+    Calculate probabilities for all
+    380 Premier League fixtures.
+    """
+
+    predictions = []
+    probabilities = []
+
+    print(
+        "Predicting season fixtures..."
+    )
+
+    for _, fixture in fixtures_df.iterrows():
+
+        prediction, probs = (
+            predict_fixture(
+                model,
+                hist_df,
+                fixture["home_team"],
+                fixture["away_team"],
+                fixture["date"]
+            )
+        )
+
+        predictions.append(
+            prediction
+        )
+
+        probabilities.append(
+            probs
+        )
+
+    results_df = fixtures_df.copy()
+
+    results_df[
+        "predicted_result"
+    ] = predictions
+
+    results_df[
+        "probabilities"
+    ] = probabilities
+
+    return results_df
+
+
+# ==================================================
+# DETERMINISTIC STANDINGS
+# ==================================================
+
+def simulate_standings(
+    predicted_fixtures,
+    teams=None
+):
+    """
+    Create standings using only the single
+    most likely result for every match.
+
+    Kept mainly for API compatibility.
+    Monte Carlo standings below should be
+    used for the main season projection.
+    """
+
     if teams is None:
-        teams = sorted(set(predicted_fixtures["home_team"]) | set(predicted_fixtures["away_team"]))
+
+        teams = sorted(
+            set(
+                predicted_fixtures[
+                    "home_team"
+                ]
+            )
+            |
+            set(
+                predicted_fixtures[
+                    "away_team"
+                ]
+            )
+        )
 
     table = {
-        team: {"played": 0, "wins": 0, "draws": 0, "losses": 0, "points": 0,
-               "match_results": []}
+        team: {
+            "played": 0,
+            "wins": 0,
+            "draws": 0,
+            "losses": 0,
+            "points": 0,
+            "match_results": [],
+        }
         for team in teams
     }
 
-    for _, row in predicted_fixtures.iterrows():
-        home, away, result = row["home_team"], row["away_team"], row["predicted_result"]
+    for _, match in (
+        predicted_fixtures.iterrows()
+    ):
 
-        if home not in table or away not in table:
-            continue  # skip any team not in our current-season list
+        home = match[
+            "home_team"
+        ]
+
+        away = match[
+            "away_team"
+        ]
+
+        result = match[
+            "predicted_result"
+        ]
 
         table[home]["played"] += 1
         table[away]["played"] += 1
 
         if result == "H":
+
             table[home]["wins"] += 1
             table[home]["points"] += 3
+
             table[away]["losses"] += 1
-            table[home]["match_results"].append(("W", away))
-            table[away]["match_results"].append(("L", home))
+
+            table[home][
+                "match_results"
+            ].append(
+                ("W", away)
+            )
+
+            table[away][
+                "match_results"
+            ].append(
+                ("L", home)
+            )
+
         elif result == "A":
+
             table[away]["wins"] += 1
             table[away]["points"] += 3
+
             table[home]["losses"] += 1
-            table[away]["match_results"].append(("W", home))
-            table[home]["match_results"].append(("L", away))
-        else:  # draw
+
+            table[away][
+                "match_results"
+            ].append(
+                ("W", home)
+            )
+
+            table[home][
+                "match_results"
+            ].append(
+                ("L", away)
+            )
+
+        else:
+
             table[home]["draws"] += 1
-            table[home]["points"] += 1
             table[away]["draws"] += 1
+
+            table[home]["points"] += 1
             table[away]["points"] += 1
-            table[home]["match_results"].append(("D", away))
-            table[away]["match_results"].append(("D", home))
+
+            table[home][
+                "match_results"
+            ].append(
+                ("D", away)
+            )
+
+            table[away][
+                "match_results"
+            ].append(
+                ("D", home)
+            )
 
     standings_df = pd.DataFrame([
         {
-            "team": team,
-            "played": stats["played"],
-            "wins": stats["wins"],
-            "draws": stats["draws"],
-            "losses": stats["losses"],
-            "points": stats["points"],
+            "team":
+                team,
+
+            "played":
+                stats["played"],
+
+            "wins":
+                stats["wins"],
+
+            "draws":
+                stats["draws"],
+
+            "losses":
+                stats["losses"],
+
+            "points":
+                stats["points"],
         }
-        for team, stats in table.items()
+
+        for team, stats
+        in table.items()
     ])
-    standings_df = standings_df.sort_values(
-        ["points", "wins"], ascending=False
-    ).reset_index(drop=True)
-    standings_df.index += 1  # ranks start at 1, not 0
 
-    return standings_df, table
+    standings_df = (
+        standings_df
+        .sort_values(
+            [
+                "points",
+                "wins"
+            ],
+            ascending=False
+        )
+        .reset_index(drop=True)
+    )
+
+    standings_df.index += 1
+
+    return (
+        standings_df,
+        table
+    )
 
 
-def print_team_results(table, team):
-    """Print every predicted match result for one team."""
-    print(f"\n--- Predicted results for {team} ---")
-    for outcome, opponent in table[team]["match_results"]:
-        label = {"W": "beat", "D": "drew with", "L": "lost to"}[outcome]
-        print(f"  {outcome}: {label} {opponent}")
+# ==================================================
+# MONTE CARLO SEASON SIMULATION
+# ==================================================
 
+def monte_carlo_standings(
+    predicted_fixtures,
+    simulations=N_SIMULATIONS
+):
+    """
+    Simulate the full Premier League season
+    thousands of times.
+
+    Instead of assuming the highest-probability
+    result happens every time, sample results
+    according to the model probabilities.
+    """
+
+    rng = np.random.default_rng(
+        RANDOM_SEED
+    )
+
+    teams = sorted(
+        set(
+            predicted_fixtures[
+                "home_team"
+            ]
+        )
+        |
+        set(
+            predicted_fixtures[
+                "away_team"
+            ]
+        )
+    )
+
+    stats = {
+        team: {
+            "points_total": 0,
+            "position_total": 0,
+            "titles": 0,
+            "top4": 0,
+            "relegations": 0,
+        }
+        for team in teams
+    }
+
+    print(
+        f"\nRunning {simulations:,} "
+        "season simulations..."
+    )
+
+    for simulation in range(
+        simulations
+    ):
+
+        season_table = {
+            team: {
+                "points": 0,
+                "wins": 0,
+            }
+            for team in teams
+        }
+
+        for _, match in (
+            predicted_fixtures.iterrows()
+        ):
+
+            home = match[
+                "home_team"
+            ]
+
+            away = match[
+                "away_team"
+            ]
+
+            probs = match[
+                "probabilities"
+            ]
+
+            # Model probabilities
+            p_home = float(
+                probs.get("H", 0)
+            )
+
+            p_draw = float(
+                probs.get("D", 0)
+            )
+
+            p_away = float(
+                probs.get("A", 0)
+            )
+
+            probability_array = np.array(
+                [
+                    p_home,
+                    p_draw,
+                    p_away
+                ],
+                dtype=float
+            )
+
+            # Normalize in case of floating point error
+            total = probability_array.sum()
+
+            if total <= 0:
+
+                probability_array = (
+                    np.array(
+                        [
+                            1 / 3,
+                            1 / 3,
+                            1 / 3
+                        ]
+                    )
+                )
+
+            else:
+
+                probability_array /= total
+
+            result = rng.choice(
+                [
+                    "H",
+                    "D",
+                    "A"
+                ],
+                p=probability_array
+            )
+
+            if result == "H":
+
+                season_table[
+                    home
+                ]["points"] += 3
+
+                season_table[
+                    home
+                ]["wins"] += 1
+
+            elif result == "A":
+
+                season_table[
+                    away
+                ]["points"] += 3
+
+                season_table[
+                    away
+                ]["wins"] += 1
+
+            else:
+
+                season_table[
+                    home
+                ]["points"] += 1
+
+                season_table[
+                    away
+                ]["points"] += 1
+
+        # Sort simulated league table
+        ranked_teams = sorted(
+            teams,
+            key=lambda team: (
+                season_table[
+                    team
+                ]["points"],
+                season_table[
+                    team
+                ]["wins"]
+            ),
+            reverse=True
+        )
+
+        for position, team in enumerate(
+            ranked_teams,
+            start=1
+        ):
+
+            stats[
+                team
+            ]["points_total"] += (
+                season_table[
+                    team
+                ]["points"]
+            )
+
+            stats[
+                team
+            ]["position_total"] += (
+                position
+            )
+
+            if position == 1:
+
+                stats[
+                    team
+                ]["titles"] += 1
+
+            if position <= 4:
+
+                stats[
+                    team
+                ]["top4"] += 1
+
+            if position >= 18:
+
+                stats[
+                    team
+                ]["relegations"] += 1
+
+    rows = []
+
+    for team in teams:
+
+        rows.append({
+            "team":
+                team,
+
+            "expected_points":
+                (
+                    stats[
+                        team
+                    ]["points_total"]
+                    / simulations
+                ),
+
+            "average_position":
+                (
+                    stats[
+                        team
+                    ]["position_total"]
+                    / simulations
+                ),
+
+            "title_chance":
+                (
+                    stats[
+                        team
+                    ]["titles"]
+                    / simulations
+                    * 100
+                ),
+
+            "top4_chance":
+                (
+                    stats[
+                        team
+                    ]["top4"]
+                    / simulations
+                    * 100
+                ),
+
+            "relegation_chance":
+                (
+                    stats[
+                        team
+                    ]["relegations"]
+                    / simulations
+                    * 100
+                ),
+        })
+
+    standings = pd.DataFrame(
+        rows
+    )
+
+    standings = (
+        standings
+        .sort_values(
+            [
+                "average_position",
+                "expected_points"
+            ],
+            ascending=[
+                True,
+                False
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    standings.index += 1
+
+    return standings
+
+
+# ==================================================
+# PRINT MONTE CARLO TABLE
+# ==================================================
+
+def print_monte_carlo_table(
+    standings
+):
+
+    display = standings.copy()
+
+    display[
+        "expected_points"
+    ] = display[
+        "expected_points"
+    ].round(1)
+
+    display[
+        "average_position"
+    ] = display[
+        "average_position"
+    ].round(2)
+
+    display[
+        "title_chance"
+    ] = display[
+        "title_chance"
+    ].round(1)
+
+    display[
+        "top4_chance"
+    ] = display[
+        "top4_chance"
+    ].round(1)
+
+    display[
+        "relegation_chance"
+    ] = display[
+        "relegation_chance"
+    ].round(1)
+
+    print(
+        "\n=== 2026/27 MONTE CARLO "
+        "PREMIER LEAGUE PROJECTION ==="
+    )
+
+    print(
+        display.to_string(
+            index=True
+        )
+    )
+
+
+# ==================================================
+# RUN
+# ==================================================
 
 if __name__ == "__main__":
-    hist_df = fetch_historical_data()
-    model = load_or_train_model(hist_df)
 
+    # Load historical training data
+    hist_df = load_historical_data()
+
+    # Train/load model
+    model = load_or_train_model(
+        hist_df
+    )
+
+    # Fetch upcoming fixtures
     fixtures_df = fetch_fixtures()
-    predicted_fixtures = predict_season(model, hist_df, fixtures_df)
 
-    standings_df, results_table = simulate_standings(predicted_fixtures)
+    # Generate probabilities for every match
+    predicted_fixtures = predict_season(
+        model,
+        hist_df,
+        fixtures_df
+    )
 
-    print("\n=== Predicted 2026/27 Premier League Standings ===")
-    print(standings_df.to_string(index=True))
+    # Run Monte Carlo simulation
+    monte_carlo_df = (
+        monte_carlo_standings(
+            predicted_fixtures,
+            simulations=5000
+        )
+    )
 
-    # Example: show match-by-match results for one team
-    print_team_results(results_table, "Arsenal FC")
+    # Print realistic expected table
+    print_monte_carlo_table(
+        monte_carlo_df
+    )

@@ -37,7 +37,7 @@ def load_predictions():
     whole season, storing everything in `cache` for endpoints to use."""
     print("Starting up — this runs the full prediction pipeline once...")
 
-    hist_df = predictor.fetch_historical_data()
+    hist_df = predictor.load_historical_data()
     model = predictor.load_or_train_model(hist_df)
 
     fixtures_df = predictor.fetch_fixtures()
